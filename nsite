@@ -7,7 +7,7 @@
 #
 set -euo pipefail
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 
 # --- constants -------------------------------------------------------------
 
@@ -152,6 +152,18 @@ site_php_label() { # <conf> — prints "8.3", "proxy:3000", "proxy" or "-"
 
 is_managed() { grep -q "$MARKER" "$1" 2>/dev/null; }
 
+tld_warnings() { # <tld> — flag TLD choices with real-world side effects
+    case "$1" in
+        test|localhost|example|invalid) ;;  # RFC 6761 reserved — always safe
+        dev|app)
+            warn ".$1 is HSTS-preloaded — browsers force HTTPS, plain http:// will NOT load; run 'nsite secure' on the site" ;;
+        local)
+            warn ".local is used by mDNS/Avahi on Linux — name resolution can be flaky" ;;
+        *)
+            warn ".$1 is a real public TLD — this hosts entry will shadow any real *.$1 site of the same name" ;;
+    esac
+}
+
 hosts_has() { # <hostname> — is it already resolvable via /etc/hosts?
     local esc="${1//./\\.}"
     grep -qE "^[^#]*[[:space:]]${esc}([[:space:]]|\$)" "$HOSTS_FILE"
@@ -227,11 +239,13 @@ EOF
 # --- add -------------------------------------------------------------------
 
 cmd_add() {
-    local name="" php_version="" root_sub="" proxy_port="" force=0 dry_run=0
+    local name="" php_version="" root_sub="" proxy_port="" tld_override="" force=0 dry_run=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --php)     if [[ $# -lt 2 ]]; then die "--php needs a version (e.g. --php 8.3)"; fi
                        php_version="$2"; shift 2 ;;
+            --tld)     if [[ $# -lt 2 ]]; then die "--tld needs a value (e.g. --tld dev)"; fi
+                       tld_override="$2"; shift 2 ;;
             --root)    if [[ $# -lt 2 ]]; then die "--root needs a subdirectory"; fi
                        root_sub="$2"; shift 2 ;;
             --proxy)   if [[ $# -lt 2 ]]; then die "--proxy needs a port"; fi
@@ -244,7 +258,10 @@ cmd_add() {
         esac
     done
     if [[ -z "$name" ]]; then
-        die "usage: nsite add <name> [--php <version>] [--root <subdir>] [--proxy <port>] [--force] [--dry-run]"
+        die "usage: nsite add <name> [--php <version>] [--root <subdir>] [--proxy <port>] [--tld <tld>] [--force] [--dry-run]"
+    fi
+    if [[ -n "$tld_override" && ! "$tld_override" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
+        die "--tld: '$tld_override' is not a valid TLD"
     fi
     if [[ ! "$name" =~ ^[A-Za-z0-9_-]+$ ]]; then
         die "site name may only contain letters, digits, '-' and '_'"
@@ -259,7 +276,9 @@ cmd_add() {
         die "--proxy: '$proxy_port' is not a valid port"
     fi
 
-    local project_dir="$WWW/$name" host="$name.$TLD"
+    local tld="${tld_override:-$TLD}"
+    local project_dir="$WWW/$name" host="$name.$tld"
+    tld_warnings "${tld##*.}"
     if [[ -z "$proxy_port" && ! -d "$project_dir" ]]; then
         die "$project_dir does not exist — create the project first (or set WWW in the nsite config)"
     fi
@@ -619,6 +638,80 @@ cmd_secure() {
     info "https://$host is ready (plain http:// still works too)"
 }
 
+# --- domain ----------------------------------------------------------------
+
+cmd_domain() { # change an existing site's hostname, e.g. blog.test → blog.dev
+    local site="${1:-}" newhost="${2:-}"
+    if [[ -z "$site" || -z "$newhost" ]]; then
+        die "usage: nsite domain <site> <new-domain>   (e.g. nsite domain blog blog.dev)"
+    fi
+    if [[ ! "$newhost" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ || "$newhost" != *.* ]]; then
+        die "'$newhost' is not a valid domain — expected something like $site.dev"
+    fi
+    local conf="$NGINX_AVAIL/$site"
+    if [[ ! -e "$conf" ]]; then die "no site named '$site'"; fi
+
+    local oldhost
+    oldhost="$(conf_value "$conf" server_name)"
+    if [[ "$oldhost" == "$newhost" ]]; then
+        info "'$site' already answers to $newhost"
+        return 0
+    fi
+    if ! is_managed "$conf"; then
+        warn "$conf was NOT created by nsite — this looks like a hand-written config"
+        if ! confirm "rewrite its server_name anyway?"; then die "aborted — nothing changed"; fi
+    fi
+    tld_warnings "${newhost##*.}"
+
+    local backup
+    backup="$(mktemp)"
+    cp "$conf" "$backup"
+    sudo sed -i -E "s|^([[:space:]]*server_name[[:space:]]+).*;|\1$newhost;|" "$conf"
+
+    # a secured site's certificate is bound to the old hostname — re-issue it
+    if is_managed "$conf" && grep -q "ssl_certificate" "$conf"; then
+        if command -v mkcert >/dev/null; then
+            info "re-issuing TLS certificate for $newhost"
+            local tmpdir
+            tmpdir="$(mktemp -d)"
+            mkcert -cert-file "$tmpdir/$newhost.pem" -key-file "$tmpdir/$newhost-key.pem" "$newhost"
+            sudo install -d -m 755 "$CERT_DIR"
+            sudo install -m 644 "$tmpdir/$newhost.pem" "$CERT_DIR/$newhost.pem"
+            sudo install -m 600 "$tmpdir/$newhost-key.pem" "$CERT_DIR/$newhost-key.pem"
+            rm -rf "$tmpdir"
+            sudo sed -i "s|$CERT_DIR/$oldhost|$CERT_DIR/$newhost|g" "$conf"
+        else
+            warn "site is secured but mkcert is missing — the certificate still matches $oldhost"
+        fi
+    fi
+
+    local removed_old=0 added_new=0
+    if [[ -n "$oldhost" && "$oldhost" != "_" ]]; then
+        if grep -qE "^[[:space:]]*127\.0\.0\.1[[:space:]]+${oldhost//./\\.}[[:space:]]*\$" "$HOSTS_FILE"; then
+            remove_hosts_line "$oldhost"
+            removed_old=1
+        fi
+    fi
+    if ! hosts_has "$newhost"; then
+        printf '127.0.0.1\t%s\n' "$newhost" | sudo tee -a "$HOSTS_FILE" >/dev/null
+        added_new=1
+    fi
+
+    if ! sudo nginx -t; then
+        err "nginx -t failed — rolling back"
+        sudo cp "$backup" "$conf"
+        if [[ $added_new -eq 1 ]]; then remove_hosts_line "$newhost"; fi
+        if [[ $removed_old -eq 1 ]]; then
+            printf '127.0.0.1\t%s\n' "$oldhost" | sudo tee -a "$HOSTS_FILE" >/dev/null
+        fi
+        rm -f "$backup"
+        die "rolled back — '$site' still answers to $oldhost"
+    fi
+    rm -f "$backup"
+    sudo systemctl reload nginx
+    info "'$site' now answers to http://$newhost (was $oldhost)"
+}
+
 # --- help ------------------------------------------------------------------
 
 usage() {
@@ -627,7 +720,7 @@ ${C_BOLD}nsite${C_RESET} $VERSION — manage local nginx dev sites
 
 ${C_BOLD}Usage:${C_RESET}
   nsite add <name> [--php <version>] [--root <subdir>] [--proxy <port>]
-                   [--force] [--dry-run]
+                   [--tld <tld>] [--force] [--dry-run]
                         Create vhost + symlink + hosts entry, test, reload
   nsite rm <name>       Remove a site's nginx config and hosts entry
   nsite list            Show enabled sites and their PHP versions
@@ -642,11 +735,14 @@ ${C_BOLD}Usage:${C_RESET}
                         Tail a site's nginx access + error logs
   nsite doctor          Check services, sockets, symlinks and hosts entries
   nsite secure <site>   Add https:// via a locally-trusted mkcert certificate
+  nsite domain <site> <new-domain>
+                        Change a site's hostname (re-issues TLS if secured)
   nsite help            This text
 
 ${C_BOLD}Examples:${C_RESET}
   nsite add blog                  # serves ~/www/blog at http://blog.test
   nsite add api --proxy 8000      # reverse-proxy api.test → 127.0.0.1:8000
+  nsite domain blog blog.dev      # rename blog.test → blog.dev (.dev needs https!)
   nsite php use blog 8.4          # move blog.test to PHP 8.4 (browser only)
   nsite secure blog               # https://blog.test
   nsite rm blog                   # remove config + hosts entry, keep ~/www/blog
@@ -669,7 +765,7 @@ main() {
         -v|--version)
             printf 'nsite %s\n' "$VERSION"
             ;;
-        add|rm|list|php|logs|doctor|secure)
+        add|rm|list|php|logs|doctor|secure|domain)
             check_system
             load_config
             "cmd_$cmd" "$@"

@@ -50,7 +50,7 @@ echo "source ~/www/nsite/nsite-completion.bash" >> ~/.bashrc   # optional tab-co
 
 ```
 nsite add <name> [--php <version>] [--root <subdir>] [--proxy <port>]
-                 [--force] [--dry-run]
+                 [--tld <tld>] [--force] [--dry-run]
 nsite rm <name>
 nsite list
 nsite php list
@@ -60,6 +60,7 @@ nsite php current [site]
 nsite logs <site> [-f]
 nsite doctor
 nsite secure <site>
+nsite domain <site> <new-domain>
 nsite help
 ```
 
@@ -74,7 +75,25 @@ nsite secure blog             # https://blog.test via mkcert
 nsite logs blog -f            # follow blog's access + error logs
 nsite doctor                  # check services, sockets, symlinks, hosts entries
 nsite rm blog                 # remove config + hosts entry, keep ~/www/blog
+nsite add blog --tld dev      # blog.dev instead of blog.test (see TLD note!)
+nsite domain blog blog.dev    # rename an existing site's hostname
 ```
+
+### Choosing a TLD
+
+The default `.test` is IETF-reserved and always safe. Anything else has
+side effects nsite will warn you about:
+
+- **`.dev`, `.app`** — real Google TLDs on the browser HSTS-preload list:
+  plain `http://` will never load; run `nsite secure <site>` for https.
+- **`.site`, `.shop`, …** — real public TLDs; your hosts entry shadows any
+  real site with the same name.
+- **`.local`** — collides with mDNS/Avahi on Linux; resolution can be flaky.
+
+`nsite domain <site> <new-domain>` renames an existing site: rewrites
+`server_name`, swaps the hosts entry, and re-issues the mkcert certificate
+if the site was secured. Rolls back on `nginx -t` failure like everything
+else.
 
 ### `nsite add`
 
