@@ -6,6 +6,12 @@ write a vhost, symlink it into `sites-enabled/`, add a `/etc/hosts` line, and
 `nginx -t && reload`. It also switches the PHP-FPM version per site and can
 add locally-trusted HTTPS via mkcert.
 
+## Documentation
+
+- **[Installation](docs/installation.md)** — requirements, install, completion, uninstall
+- **[Getting started](docs/getting-started.md)** — first site, PHP switching, HTTPS, proxy mode, debugging
+- **[Command reference](docs/commands.md)** — every command, option, and behavior in detail
+
 ## Design philosophy
 
 - **Additive, not invasive.** nsite only writes files it created (marked with a
