@@ -60,7 +60,8 @@ nsite php current [site]
 nsite logs <site> [-f]
 nsite doctor
 nsite secure <site>
-nsite domain <site> <new-domain>
+nsite domain <new-domain>            # site inferred from first label
+nsite domain <site> <new-domain>     # explicit, when name ≠ hostname
 nsite help
 ```
 
@@ -76,7 +77,7 @@ nsite logs blog -f            # follow blog's access + error logs
 nsite doctor                  # check services, sockets, symlinks, hosts entries
 nsite rm blog                 # remove config + hosts entry, keep ~/www/blog
 nsite add blog --tld dev      # blog.dev instead of blog.test (see TLD note!)
-nsite domain blog blog.dev    # rename an existing site's hostname
+nsite domain blog.dev         # rename site 'blog' to blog.dev
 ```
 
 ### Choosing a TLD
@@ -90,7 +91,9 @@ side effects nsite will warn you about:
   real site with the same name.
 - **`.local`** — collides with mDNS/Avahi on Linux; resolution can be flaky.
 
-`nsite domain <site> <new-domain>` renames an existing site: rewrites
+`nsite domain <new-domain>` renames an existing site (the site is inferred
+from the domain's first label; pass `<site> <new-domain>` explicitly when
+the config name and hostname differ): it rewrites
 `server_name`, swaps the hosts entry, and re-issues the mkcert certificate
 if the site was secured. Rolls back on `nginx -t` failure like everything
 else.

@@ -642,14 +642,21 @@ cmd_secure() {
 
 cmd_domain() { # change an existing site's hostname, e.g. blog.test → blog.dev
     local site="${1:-}" newhost="${2:-}"
+    # shorthand: 'nsite domain blog.dev' — the site is the first label
+    if [[ -z "$newhost" && "$site" == *.* ]]; then
+        newhost="$site"
+        site="${site%%.*}"
+    fi
     if [[ -z "$site" || -z "$newhost" ]]; then
-        die "usage: nsite domain <site> <new-domain>   (e.g. nsite domain blog blog.dev)"
+        die "usage: nsite domain <new-domain> | nsite domain <site> <new-domain>"
     fi
     if [[ ! "$newhost" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ || "$newhost" != *.* ]]; then
         die "'$newhost' is not a valid domain — expected something like $site.dev"
     fi
     local conf="$NGINX_AVAIL/$site"
-    if [[ ! -e "$conf" ]]; then die "no site named '$site'"; fi
+    if [[ ! -e "$conf" ]]; then
+        die "no site named '$site' — if the site's name differs from the hostname, use: nsite domain <site> <new-domain>"
+    fi
 
     local oldhost
     oldhost="$(conf_value "$conf" server_name)"
@@ -735,14 +742,15 @@ ${C_BOLD}Usage:${C_RESET}
                         Tail a site's nginx access + error logs
   nsite doctor          Check services, sockets, symlinks and hosts entries
   nsite secure <site>   Add https:// via a locally-trusted mkcert certificate
-  nsite domain <site> <new-domain>
-                        Change a site's hostname (re-issues TLS if secured)
+  nsite domain <new-domain> | nsite domain <site> <new-domain>
+                        Change a site's hostname (re-issues TLS if secured);
+                        one-arg form infers the site from the first label
   nsite help            This text
 
 ${C_BOLD}Examples:${C_RESET}
   nsite add blog                  # serves ~/www/blog at http://blog.test
   nsite add api --proxy 8000      # reverse-proxy api.test → 127.0.0.1:8000
-  nsite domain blog blog.dev      # rename blog.test → blog.dev (.dev needs https!)
+  nsite domain blog.dev           # rename site 'blog' → blog.dev (.dev needs https!)
   nsite php use blog 8.4          # move blog.test to PHP 8.4 (browser only)
   nsite secure blog               # https://blog.test
   nsite rm blog                   # remove config + hosts entry, keep ~/www/blog
