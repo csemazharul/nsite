@@ -7,14 +7,15 @@
 #
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 
 # --- constants -------------------------------------------------------------
 
 NGINX_AVAIL="/etc/nginx/sites-available"
 NGINX_ENABLED="/etc/nginx/sites-enabled"
-# shellcheck disable=SC2034  # used from phase 1 (remove directive then)
 HOSTS_FILE="/etc/hosts"
+CERT_DIR="/etc/nginx/nsite-certs"
+MARKER="managed by nsite"
 
 # --- output helpers --------------------------------------------------------
 
@@ -39,15 +40,18 @@ die() {
     exit 1
 }
 
+confirm() { # confirm "question?" — returns 0 on yes, 1 otherwise (default No)
+    local reply
+    read -r -p "$1 [y/N] " reply
+    [[ "$reply" =~ ^[Yy]([Ee][Ss])?$ ]]
+}
+
 # --- configuration ---------------------------------------------------------
 
 # Defaults; override in ${XDG_CONFIG_HOME:-~/.config}/nsite/config (plain bash).
-# shellcheck disable=SC2034  # consumed from phase 1 on (remove directive then)
-{
-    WWW="$HOME/www"     # where projects live
-    TLD="test"          # site.test
-    PHP_SOCK=""         # empty = auto-detect newest running PHP-FPM
-}
+WWW="$HOME/www"     # where projects live
+TLD="test"          # site.test
+PHP_SOCK=""         # empty = auto-detect newest running PHP-FPM
 
 load_config() {
     local config_file="${XDG_CONFIG_HOME:-$HOME/.config}/nsite/config"
@@ -71,6 +75,550 @@ check_system() {
         || die "$NGINX_ENABLED not found — nsite requires a Debian-style nginx layout"
 }
 
+# --- shared helpers --------------------------------------------------------
+
+installed_php_versions() { # one version per line, oldest first
+    local dir
+    for dir in /etc/php/*/fpm; do
+        if [[ -d "$dir" ]]; then
+            basename "$(dirname "$dir")"
+        fi
+    done | sort -V
+}
+
+cli_php_version() { # e.g. "8.3", or "none" if no php CLI
+    if ! command -v php >/dev/null; then
+        printf 'none'
+        return
+    fi
+    php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;'
+}
+
+detect_php_sock() { # newest installed version whose FPM service is running
+    if [[ -n "$PHP_SOCK" ]]; then
+        printf '%s\n' "$PHP_SOCK"
+        return
+    fi
+    local v newest=""
+    while read -r v; do
+        if systemctl is-active --quiet "php$v-fpm"; then
+            newest="$v"
+        fi
+    done < <(installed_php_versions)
+    if [[ -z "$newest" ]]; then
+        die "no running PHP-FPM found — install one (sudo apt install php-fpm) or set PHP_SOCK in the nsite config"
+    fi
+    printf '/run/php/php%s-fpm.sock\n' "$newest"
+}
+
+ensure_php_version() { # <version> <dry_run 0|1> — installed? running? (offers to start)
+    local v="$1" dry="$2"
+    if [[ ! -d "/etc/php/$v/fpm" ]]; then
+        err "PHP $v is not installed"
+        printf 'install it with:\n  sudo add-apt-repository ppa:ondrej/php\n  sudo apt install php%s-fpm\n' "$v" >&2
+        exit 1
+    fi
+    if ! systemctl is-active --quiet "php$v-fpm"; then
+        if [[ "$dry" -eq 1 ]]; then
+            warn "php$v-fpm is not running (would offer to start it)"
+        elif confirm "php$v-fpm is installed but not running — start and enable it now?"; then
+            sudo systemctl enable --now "php$v-fpm"
+        else
+            die "php$v-fpm must be running for the site to work"
+        fi
+    fi
+}
+
+conf_value() { # <file> <directive> — first uncommented value, ';' stripped
+    awk -v d="$2" '$1 == d { sub(/;$/, "", $2); print $2; exit }' "$1"
+}
+
+site_php_label() { # <conf> — prints "8.3", "proxy:3000", "proxy" or "-"
+    local pass
+    pass="$(conf_value "$1" fastcgi_pass)"
+    if [[ "$pass" =~ php([0-9]+\.[0-9]+)-fpm\.sock ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return
+    fi
+    pass="$(conf_value "$1" proxy_pass)"
+    if [[ "$pass" =~ :([0-9]+)$ ]]; then
+        printf 'proxy:%s\n' "${BASH_REMATCH[1]}"
+    elif [[ -n "$pass" ]]; then
+        printf 'proxy\n'
+    else
+        printf -- '-\n'
+    fi
+}
+
+is_managed() { grep -q "$MARKER" "$1" 2>/dev/null; }
+
+hosts_has() { # <hostname> — is it already resolvable via /etc/hosts?
+    local esc="${1//./\\.}"
+    grep -qE "^[^#]*[[:space:]]${esc}([[:space:]]|\$)" "$HOSTS_FILE"
+}
+
+remove_hosts_line() { # <hostname> — removes only an exact "127.0.0.1 <host>" line
+    local host="$1" esc="${1//./\\.}"
+    sudo sed -i -E "/^[[:space:]]*127\.0\.0\.1[[:space:]]+${esc}[[:space:]]*\$/d" "$HOSTS_FILE"
+    if hosts_has "$host"; then
+        warn "$host still appears in $HOSTS_FILE (shared or custom line) — remove it manually if needed"
+    fi
+}
+
+# --- vhost templates -------------------------------------------------------
+
+vhost_php() { # <name> <host> <docroot> <socket>
+    local name="$1" host="$2" docroot="$3" sock="$4"
+    cat <<EOF
+# $MARKER (v$VERSION) — edit freely; nsite asks before overwriting
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $host;
+
+    root $docroot;
+    index index.php index.html;
+
+    access_log /var/log/nginx/$name.access.log;
+    error_log /var/log/nginx/$name.error.log;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
+    location ~ \.php\$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:$sock;
+    }
+
+    location ~ /\.(?!well-known) {
+        deny all;
+    }
+}
+EOF
+}
+
+vhost_proxy() { # <name> <host> <port>
+    local name="$1" host="$2" port="$3"
+    cat <<EOF
+# $MARKER (v$VERSION) — edit freely; nsite asks before overwriting
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $host;
+
+    access_log /var/log/nginx/$name.access.log;
+    error_log /var/log/nginx/$name.error.log;
+
+    location / {
+        proxy_pass http://127.0.0.1:$port;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+}
+EOF
+}
+
+# --- add -------------------------------------------------------------------
+
+cmd_add() {
+    local name="" php_version="" root_sub="" proxy_port="" force=0 dry_run=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --php)     if [[ $# -lt 2 ]]; then die "--php needs a version (e.g. --php 8.3)"; fi
+                       php_version="$2"; shift 2 ;;
+            --root)    if [[ $# -lt 2 ]]; then die "--root needs a subdirectory"; fi
+                       root_sub="$2"; shift 2 ;;
+            --proxy)   if [[ $# -lt 2 ]]; then die "--proxy needs a port"; fi
+                       proxy_port="$2"; shift 2 ;;
+            --force)   force=1; shift ;;
+            --dry-run) dry_run=1; shift ;;
+            -*)        die "unknown option '$1' — see 'nsite help'" ;;
+            *)         if [[ -n "$name" ]]; then die "unexpected argument '$1'"; fi
+                       name="$1"; shift ;;
+        esac
+    done
+    if [[ -z "$name" ]]; then
+        die "usage: nsite add <name> [--php <version>] [--root <subdir>] [--proxy <port>] [--force] [--dry-run]"
+    fi
+    if [[ ! "$name" =~ ^[A-Za-z0-9_-]+$ ]]; then
+        die "site name may only contain letters, digits, '-' and '_'"
+    fi
+    if [[ -n "$php_version" && -n "$proxy_port" ]]; then
+        die "--php and --proxy are mutually exclusive"
+    fi
+    if [[ -n "$root_sub" && -n "$proxy_port" ]]; then
+        die "--root has no effect with --proxy"
+    fi
+    if [[ -n "$proxy_port" ]] && ! [[ "$proxy_port" =~ ^[0-9]+$ && "$proxy_port" -ge 1 && "$proxy_port" -le 65535 ]]; then
+        die "--proxy: '$proxy_port' is not a valid port"
+    fi
+
+    local project_dir="$WWW/$name" host="$name.$TLD"
+    if [[ -z "$proxy_port" && ! -d "$project_dir" ]]; then
+        die "$project_dir does not exist — create the project first (or set WWW in the nsite config)"
+    fi
+
+    local docroot=""
+    if [[ -z "$proxy_port" ]]; then
+        if [[ -n "$root_sub" ]]; then
+            docroot="$project_dir/$root_sub"
+            if [[ ! -d "$docroot" ]]; then die "--root: $docroot does not exist"; fi
+        elif [[ -d "$project_dir/public" ]]; then
+            docroot="$project_dir/public"
+        else
+            docroot="$project_dir"
+        fi
+    fi
+
+    local sock=""
+    if [[ -z "$proxy_port" ]]; then
+        if [[ -n "$php_version" ]]; then
+            ensure_php_version "$php_version" "$dry_run"
+            sock="/run/php/php$php_version-fpm.sock"
+        else
+            sock="$(detect_php_sock)"
+        fi
+    fi
+
+    local content
+    if [[ -n "$proxy_port" ]]; then
+        content="$(vhost_proxy "$name" "$host" "$proxy_port")"
+    else
+        content="$(vhost_php "$name" "$host" "$docroot" "$sock")"
+    fi
+
+    local conf="$NGINX_AVAIL/$name" link="$NGINX_ENABLED/$name"
+
+    if [[ $dry_run -eq 1 ]]; then
+        info "dry run — nothing will be changed"
+        if [[ -e "$conf" ]]; then
+            warn "$conf already exists and would need confirmation (or --force)"
+        fi
+        printf 'would write %s:\n' "$conf"
+        printf '%s\n' "$content" | sed 's/^/    /'
+        printf 'would symlink %s -> %s\n' "$link" "$conf"
+        if hosts_has "$host"; then
+            printf '%s is already in %s\n' "$host" "$HOSTS_FILE"
+        else
+            printf 'would append "127.0.0.1  %s" to %s\n' "$host" "$HOSTS_FILE"
+        fi
+        printf 'would run: sudo nginx -t && sudo systemctl reload nginx\n'
+        return 0
+    fi
+
+    local had_conf=0 had_link=0 backup=""
+    if [[ -e "$conf" ]]; then
+        had_conf=1
+        if [[ $force -eq 0 ]]; then
+            if ! is_managed "$conf"; then
+                warn "$conf exists and was NOT created by nsite — it may be one of your hand-written sites"
+            fi
+            if ! confirm "overwrite $conf?"; then
+                die "aborted — nothing changed"
+            fi
+        fi
+        backup="$(mktemp)"
+        cp "$conf" "$backup"
+    fi
+    if [[ -L "$link" ]]; then had_link=1; fi
+
+    info "writing $conf"
+    printf '%s\n' "$content" | sudo tee "$conf" >/dev/null
+    sudo ln -sfn "$conf" "$link"
+
+    local hosts_added=0
+    if ! hosts_has "$host"; then
+        info "adding $host to $HOSTS_FILE"
+        printf '127.0.0.1\t%s\n' "$host" | sudo tee -a "$HOSTS_FILE" >/dev/null
+        hosts_added=1
+    fi
+
+    if ! sudo nginx -t; then
+        err "nginx -t rejected the new config — rolling back"
+        if [[ $had_conf -eq 1 ]]; then
+            sudo cp "$backup" "$conf"
+            if [[ $had_link -eq 0 ]]; then sudo rm -f "$link"; fi
+        else
+            sudo rm -f "$link" "$conf"
+        fi
+        if [[ $hosts_added -eq 1 ]]; then remove_hosts_line "$host"; fi
+        if [[ -n "$backup" ]]; then rm -f "$backup"; fi
+        die "rolled back — nginx is unchanged"
+    fi
+    if [[ -n "$backup" ]]; then rm -f "$backup"; fi
+    sudo systemctl reload nginx
+
+    if [[ -n "$proxy_port" ]]; then
+        info "site ready: http://$host → http://127.0.0.1:$proxy_port"
+    else
+        info "site ready: http://$host → $docroot (${sock##*/})"
+    fi
+}
+
+# --- rm --------------------------------------------------------------------
+
+cmd_rm() {
+    local name="${1:-}"
+    if [[ -z "$name" ]]; then die "usage: nsite rm <name>"; fi
+    local conf="$NGINX_AVAIL/$name" link="$NGINX_ENABLED/$name"
+    if [[ ! -e "$conf" && ! -L "$link" ]]; then die "no site named '$name'"; fi
+
+    local host=""
+    if [[ -e "$conf" ]]; then
+        host="$(conf_value "$conf" server_name)"
+        if ! is_managed "$conf"; then
+            warn "$conf was NOT created by nsite — this looks like a hand-written config"
+        fi
+    fi
+    if ! confirm "remove site '$name'? (nginx config + hosts entry; $WWW/$name is untouched)"; then
+        die "aborted — nothing changed"
+    fi
+    sudo rm -f "$link" "$conf"
+    if [[ -n "$host" && "$host" != "_" ]]; then remove_hosts_line "$host"; fi
+    sudo nginx -t
+    sudo systemctl reload nginx
+    info "removed '$name' — project files in $WWW/$name are untouched"
+}
+
+# --- list ------------------------------------------------------------------
+
+cmd_list() {
+    printf '%-14s %-24s %-10s %-7s %-7s %s\n' NAME HOST PHP LINK BY ROOT
+    local link name host root phpl by
+    for link in "$NGINX_ENABLED"/*; do
+        if [[ ! -e "$link" && ! -L "$link" ]]; then continue; fi
+        name="$(basename "$link")"
+        if [[ ! -e "$link" ]]; then
+            printf '%-14s %-24s %-10s %-7s %-7s %s\n' "$name" - - BROKEN - "target: $(readlink "$link")"
+            continue
+        fi
+        host="$(conf_value "$link" server_name)"
+        root="$(conf_value "$link" root)"
+        phpl="$(site_php_label "$link")"
+        if is_managed "$link"; then by=nsite; else by=manual; fi
+        printf '%-14s %-24s %-10s %-7s %-7s %s\n' "$name" "${host:--}" "$phpl" ok "$by" "${root:--}"
+    done
+}
+
+# --- php -------------------------------------------------------------------
+
+php_list() {
+    local cliv v state sock cli
+    cliv="$(cli_php_version)"
+    printf '%-9s %-9s %-34s %s\n' VERSION FPM SOCKET CLI
+    while read -r v; do
+        if systemctl is-active --quiet "php$v-fpm"; then state=running; else state=stopped; fi
+        sock="/run/php/php$v-fpm.sock"
+        if [[ ! -S "$sock" ]]; then sock="$sock (missing)"; fi
+        cli=""
+        if [[ "$v" == "$cliv" ]]; then cli="← cli default"; fi
+        printf '%-9s %-9s %-34s %s\n' "$v" "$state" "$sock" "$cli"
+    done < <(installed_php_versions)
+}
+
+php_use() {
+    local site="${1:-}" v="${2:-}"
+    if [[ -z "$site" || -z "$v" ]]; then die "usage: nsite php use <site> <version>"; fi
+    local conf="$NGINX_AVAIL/$site"
+    if [[ ! -e "$conf" ]]; then die "no site named '$site' in $NGINX_AVAIL"; fi
+    if [[ -n "$(conf_value "$conf" proxy_pass)" ]]; then
+        die "'$site' is a proxy site — it has no PHP to switch"
+    fi
+    if [[ -z "$(conf_value "$conf" fastcgi_pass)" ]]; then
+        die "no fastcgi_pass line found in $conf — nothing to switch"
+    fi
+    ensure_php_version "$v" 0
+
+    local backup
+    backup="$(mktemp)"
+    cp "$conf" "$backup"
+    sudo sed -i -E "s|^([[:space:]]*fastcgi_pass[[:space:]]+)unix:[^;]+;|\1unix:/run/php/php$v-fpm.sock;|" "$conf"
+    if ! sudo nginx -t; then
+        sudo cp "$backup" "$conf"
+        rm -f "$backup"
+        die "nginx -t failed — restored the previous config"
+    fi
+    rm -f "$backup"
+    sudo systemctl reload nginx
+    info "'$site' now serves PHP $v (browser only — the terminal 'php' is unchanged)"
+}
+
+php_cli() {
+    local v="${1:-}"
+    if [[ -z "$v" ]]; then die "usage: nsite php cli <version>"; fi
+    if [[ ! -x "/usr/bin/php$v" ]]; then
+        die "PHP $v CLI not found at /usr/bin/php$v — is it installed?"
+    fi
+    sudo update-alternatives --set php "/usr/bin/php$v"
+    info "terminal 'php' is now $v"
+    warn "this does NOT change what any website serves — use 'nsite php use <site> $v' for that"
+}
+
+php_current() {
+    local site="${1:-}"
+    if [[ -n "$site" ]]; then
+        local conf="$NGINX_AVAIL/$site"
+        if [[ ! -e "$conf" ]]; then die "no site named '$site'"; fi
+        site_php_label "$conf"
+        return
+    fi
+    info "CLI default: PHP $(cli_php_version) (what 'php' and composer run in the terminal)"
+    local link
+    for link in "$NGINX_ENABLED"/*; do
+        if [[ ! -e "$link" ]]; then continue; fi
+        printf '  %-14s %s\n' "$(basename "$link")" "$(site_php_label "$link")"
+    done
+}
+
+cmd_php() {
+    local sub="${1:-list}"
+    if [[ $# -gt 0 ]]; then shift; fi
+    case "$sub" in
+        list)    php_list ;;
+        use)     php_use "$@" ;;
+        cli)     php_cli "$@" ;;
+        current) php_current "$@" ;;
+        *)       die "unknown 'php' subcommand '$sub' — try 'nsite help'" ;;
+    esac
+}
+
+# --- logs ------------------------------------------------------------------
+
+cmd_logs() {
+    local follow=0 site=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -f|--follow) follow=1; shift ;;
+            -*)          die "unknown option '$1' for logs" ;;
+            *)           if [[ -n "$site" ]]; then die "unexpected argument '$1'"; fi
+                         site="$1"; shift ;;
+        esac
+    done
+    if [[ -z "$site" ]]; then die "usage: nsite logs <site> [-f]"; fi
+
+    local files=() f
+    for f in "/var/log/nginx/$site.access.log" "/var/log/nginx/$site.error.log"; do
+        if sudo test -e "$f"; then files+=("$f"); fi
+    done
+    if [[ ${#files[@]} -eq 0 ]]; then
+        die "no logs at /var/log/nginx/$site.*.log — hand-written configs may log to the shared access.log"
+    fi
+    if [[ $follow -eq 1 ]]; then
+        sudo tail -n 20 -f "${files[@]}"
+    else
+        sudo tail -n 30 "${files[@]}"
+    fi
+}
+
+# --- doctor ----------------------------------------------------------------
+
+cmd_doctor() {
+    local fails=0
+    ok()  { printf '  %s✓%s %s\n' "$C_GREEN" "$C_RESET" "$1"; }
+    bad() { printf '  %s✗%s %s\n' "$C_RED" "$C_ERESET" "$1"; fails=$((fails + 1)); }
+
+    info "services"
+    if systemctl is-active --quiet nginx; then
+        ok "nginx running"
+    else
+        bad "nginx not running (sudo systemctl start nginx)"
+    fi
+    local v
+    while read -r v; do
+        if systemctl is-active --quiet "php$v-fpm"; then
+            ok "php$v-fpm running"
+        else
+            bad "php$v-fpm installed but not running (sudo systemctl start php$v-fpm)"
+        fi
+    done < <(installed_php_versions)
+
+    info "sites"
+    local link name host root pass sock before
+    for link in "$NGINX_ENABLED"/*; do
+        if [[ ! -e "$link" && ! -L "$link" ]]; then continue; fi
+        name="$(basename "$link")"
+        if [[ ! -e "$link" ]]; then
+            bad "$name: broken symlink → $(readlink "$link")"
+            continue
+        fi
+        before=$fails
+        host="$(conf_value "$link" server_name)"
+        root="$(conf_value "$link" root)"
+        if [[ -n "$root" && ! -d "$root" ]]; then
+            bad "$name: document root $root does not exist"
+        fi
+        if [[ -n "$host" && "$host" != "_" && "$host" != localhost ]]; then
+            if ! hosts_has "$host"; then
+                bad "$name: $host is not in $HOSTS_FILE"
+            fi
+        fi
+        pass="$(conf_value "$link" fastcgi_pass)"
+        if [[ "$pass" == unix:* ]]; then
+            sock="${pass#unix:}"
+            if [[ ! -S "$sock" ]]; then
+                bad "$name: PHP socket $sock does not exist (FPM not running?)"
+            fi
+        fi
+        if [[ $fails -eq $before ]]; then ok "$name"; fi
+    done
+
+    if [[ $fails -eq 0 ]]; then
+        info "no problems found"
+    else
+        die "$fails problem(s) found"
+    fi
+}
+
+# --- secure ----------------------------------------------------------------
+
+cmd_secure() {
+    local site="${1:-}"
+    if [[ -z "$site" ]]; then die "usage: nsite secure <site>"; fi
+    command -v mkcert >/dev/null \
+        || die "mkcert is required for local TLS — sudo apt install mkcert (https://github.com/FiloSottile/mkcert)"
+    local conf="$NGINX_AVAIL/$site"
+    if [[ ! -e "$conf" ]]; then die "no site named '$site'"; fi
+    if ! is_managed "$conf"; then
+        die "'$site' is a hand-written config — add the ssl directives yourself so nsite doesn't clobber it"
+    fi
+    if grep -q "ssl_certificate" "$conf"; then
+        info "'$site' already has TLS configured"
+        return 0
+    fi
+    local host
+    host="$(conf_value "$conf" server_name)"
+    if [[ -z "$host" ]]; then die "could not read server_name from $conf"; fi
+
+    info "generating a locally-trusted certificate for $host"
+    mkcert -install
+    local tmpdir
+    tmpdir="$(mktemp -d)"
+    mkcert -cert-file "$tmpdir/$host.pem" -key-file "$tmpdir/$host-key.pem" "$host"
+    sudo install -d -m 755 "$CERT_DIR"
+    sudo install -m 644 "$tmpdir/$host.pem" "$CERT_DIR/$host.pem"
+    sudo install -m 600 "$tmpdir/$host-key.pem" "$CERT_DIR/$host-key.pem"
+    rm -rf "$tmpdir"
+
+    local backup
+    backup="$(mktemp)"
+    cp "$conf" "$backup"
+    sudo sed -i "/^[[:space:]]*listen \[::\]:80;\$/a\\    listen 443 ssl;\\n    listen [::]:443 ssl;\\n    ssl_certificate $CERT_DIR/$host.pem;\\n    ssl_certificate_key $CERT_DIR/$host-key.pem;" "$conf"
+    if ! sudo nginx -t; then
+        sudo cp "$backup" "$conf"
+        rm -f "$backup"
+        die "nginx -t failed — restored the previous config"
+    fi
+    rm -f "$backup"
+    sudo systemctl reload nginx
+    info "https://$host is ready (plain http:// still works too)"
+}
+
 # --- help ------------------------------------------------------------------
 
 usage() {
@@ -90,12 +638,17 @@ ${C_BOLD}Usage:${C_RESET}
                         Switch the terminal default (php -v) — sites unaffected
   nsite php current [site]
                         Show a site's PHP version, or all of them
+  nsite logs <site> [-f]
+                        Tail a site's nginx access + error logs
+  nsite doctor          Check services, sockets, symlinks and hosts entries
+  nsite secure <site>   Add https:// via a locally-trusted mkcert certificate
   nsite help            This text
 
 ${C_BOLD}Examples:${C_RESET}
   nsite add blog                  # serves ~/www/blog at http://blog.test
-  nsite add shop --php 8.3        # same, pinned to PHP-FPM 8.3
+  nsite add api --proxy 8000      # reverse-proxy api.test → 127.0.0.1:8000
   nsite php use blog 8.4          # move blog.test to PHP 8.4 (browser only)
+  nsite secure blog               # https://blog.test
   nsite rm blog                   # remove config + hosts entry, keep ~/www/blog
 
 Config: ${XDG_CONFIG_HOME:-$HOME/.config}/nsite/config (bash, optional)
@@ -103,18 +656,11 @@ Defaults: WWW=\$HOME/www  TLD=test  PHP_SOCK= (auto-detect)
 EOF
 }
 
-# --- commands (stubs — filled in by later phases) --------------------------
-
-cmd_add()  { die "'add' is not implemented yet (phase 1)"; }
-cmd_rm()   { die "'rm' is not implemented yet (phase 1)"; }
-cmd_list() { die "'list' is not implemented yet (phase 1)"; }
-cmd_php()  { die "'php' is not implemented yet (phase 2)"; }
-
 # --- dispatch --------------------------------------------------------------
 
 main() {
     local cmd="${1:-help}"
-    [[ $# -gt 0 ]] && shift
+    if [[ $# -gt 0 ]]; then shift; fi
 
     case "$cmd" in
         help|-h|--help)
@@ -123,7 +669,7 @@ main() {
         -v|--version)
             printf 'nsite %s\n' "$VERSION"
             ;;
-        add|rm|list|php)
+        add|rm|list|php|logs|doctor|secure)
             check_system
             load_config
             "cmd_$cmd" "$@"

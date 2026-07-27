@@ -3,7 +3,8 @@
 A small bash CLI that manages local nginx dev sites on Debian-style systems
 (Ubuntu, Pop!_OS, Debian). One command replaces the usual four manual steps:
 write a vhost, symlink it into `sites-enabled/`, add a `/etc/hosts` line, and
-`nginx -t && reload`. It also switches the PHP-FPM version per site.
+`nginx -t && reload`. It also switches the PHP-FPM version per site and can
+add locally-trusted HTTPS via mkcert.
 
 ## Design philosophy
 
@@ -21,16 +22,17 @@ write a vhost, symlink it into `sites-enabled/`, add a `/etc/hosts` line, and
 
 | Command | Status |
 |---|---|
-| `nsite help`, `--version` | ✅ working |
-| `nsite add / rm / list` | 🚧 phase 1 — not implemented yet |
-| `nsite php ...` | 🚧 phase 2 — not implemented yet |
-| `--proxy`, `--dry-run`, `--force` | 🚧 phase 3 |
-| `install.sh`, `.deb` package | 🚧 phase 4 |
+| `nsite add / rm / list` (incl. `--proxy`, `--dry-run`, `--force`) | ✅ working |
+| `nsite php list / use / cli / current` | ✅ working |
+| `nsite logs / doctor / secure` | ✅ working |
+| Bash completion | ✅ `nsite-completion.bash` |
+| `install.sh`, `.deb` package | 🚧 planned |
 
 ## Requirements
 
 - bash 4+, nginx with the Debian layout (`/etc/nginx/sites-available` +
   `sites-enabled`), PHP-FPM for PHP sites.
+- [mkcert](https://github.com/FiloSottile/mkcert) — only for `nsite secure`.
 - A user with sudo rights. **Do not run nsite itself as root** — it refuses,
   and calls `sudo` only for the few commands that need it (writing configs,
   editing `/etc/hosts`, reloading nginx).
@@ -41,6 +43,7 @@ write a vhost, symlink it into `sites-enabled/`, add a `/etc/hosts` line, and
 git clone <this repo> ~/www/nsite     # or just copy the script
 chmod +x ~/www/nsite/nsite
 sudo ln -s ~/www/nsite/nsite /usr/local/bin/nsite   # optional, puts it on PATH
+echo "source ~/www/nsite/nsite-completion.bash" >> ~/.bashrc   # optional tab-completion
 ```
 
 ## Usage
@@ -54,6 +57,9 @@ nsite php list
 nsite php use <site> <version>
 nsite php cli <version>
 nsite php current [site]
+nsite logs <site> [-f]
+nsite doctor
+nsite secure <site>
 nsite help
 ```
 
@@ -64,6 +70,9 @@ nsite add blog                # serves ~/www/blog at http://blog.test
 nsite add shop --php 8.3      # same, pinned to PHP-FPM 8.3
 nsite add dash --proxy 3000   # reverse-proxy to a Next.js dev server
 nsite php use blog 8.4        # move blog.test to PHP 8.4 (browser only)
+nsite secure blog             # https://blog.test via mkcert
+nsite logs blog -f            # follow blog's access + error logs
+nsite doctor                  # check services, sockets, symlinks, hosts entries
 nsite rm blog                 # remove config + hosts entry, keep ~/www/blog
 ```
 
@@ -73,7 +82,11 @@ Expects your project at `$WWW/<name>` (default `~/www/<name>`). Document root
 auto-detection: `public/` subdirectory if it exists, otherwise the project
 root; `--root <subdir>` overrides. Creates the vhost, enables it, adds the
 hosts entry, runs `nginx -t`, reloads. If the config test fails, everything
-just written is rolled back — nginx is never left broken.
+just written is rolled back — nginx is never left broken. `--dry-run` prints
+the exact config and actions without touching anything.
+
+Proxy mode (`--proxy <port>`) generates a reverse-proxy vhost (with websocket
+headers) instead of a PHP one — for Next.js, Vite, FastAPI and friends.
 
 ### Site PHP vs CLI PHP — the distinction that matters
 
@@ -85,6 +98,13 @@ just written is rolled back — nginx is never left broken.
 
 They are completely independent. `blog.test` can run 8.3 while your terminal
 runs 8.4.
+
+### `nsite secure`
+
+Runs mkcert for the site's hostname, installs the cert under
+`/etc/nginx/nsite-certs/`, and adds the `listen 443 ssl` + certificate lines
+to the site's config. Only works on nsite-managed configs — it refuses to
+edit hand-written ones. Idempotent: already-secured sites are left alone.
 
 ## Configuration
 
@@ -98,18 +118,23 @@ PHP_SOCK=""       # empty = auto-detect newest running PHP-FPM socket
 
 No config file is needed if the defaults suit you.
 
+## Non-goals
+
+- No dnsmasq / wildcard DNS — hosts entries are explicit lines in `/etc/hosts`.
+- No database provisioning, PHP installation, or project scaffolding.
+- No daemon, no background anything. It's a script.
+
 ## Development
 
 The whole tool is one script: [`nsite`](nsite). Ground rules for changes:
 
-- Must pass `shellcheck` with no warnings (`shellcheck nsite`).
+- Must pass `shellcheck` with no warnings (`shellcheck nsite nsite-completion.bash`).
 - `set -euo pipefail` stays; quote everything — paths with spaces must work.
-- Target is ~300 lines total. If a feature needs more, it belongs elsewhere.
 - Never modify configs nsite didn't create; never store state outside the
   nginx configs; every sudo call is per-command, never a blanket escalation.
 
-Quick smoke test:
+Quick smoke test (read-only, safe to run anywhere):
 
 ```sh
-bash -n nsite && ./nsite help && ./nsite bogus; echo "exit=$?"   # expect exit=1
+bash -n nsite && ./nsite help >/dev/null && ./nsite list && ./nsite php list && ./nsite doctor
 ```
