@@ -16,6 +16,29 @@ internally only for the specific commands that need it.
 
 ## Install
 
+### Quick (recommended)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/csemazharul/nsite/main/install.sh | bash
+```
+
+The installer:
+
+1. clones the repo to `~/.local/share/nsite` (or updates it if already there —
+   re-running the command is how you upgrade);
+2. symlinks `nsite` into `/usr/local/bin` — the only step that may ask for
+   your sudo password;
+3. offers to enable tab completion in `~/.bashrc` (skipped silently when piped);
+4. verifies the install by running `nsite --version`.
+
+Running it from a local checkout (`./install.sh`) installs from that checkout
+instead of cloning. Environment overrides: `NSITE_INSTALL_DIR` (code location),
+`NSITE_BIN_DIR` (symlink location).
+
+To remove: `~/.local/share/nsite/install.sh --uninstall`.
+
+### Manual
+
 ```sh
 git clone https://github.com/csemazharul/nsite ~/www/nsite
 chmod +x ~/www/nsite/nsite

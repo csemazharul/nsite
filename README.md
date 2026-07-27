@@ -43,14 +43,28 @@ add locally-trusted HTTPS via mkcert.
   and calls `sudo` only for the few commands that need it (writing configs,
   editing `/etc/hosts`, reloading nginx).
 
-## Install (for now)
+## Install
+
+One command:
 
 ```sh
-git clone <this repo> ~/www/nsite     # or just copy the script
-chmod +x ~/www/nsite/nsite
-sudo ln -s ~/www/nsite/nsite /usr/local/bin/nsite   # optional, puts it on PATH
-echo "source ~/www/nsite/nsite-completion.bash" >> ~/.bashrc   # optional tab-completion
+curl -fsSL https://raw.githubusercontent.com/csemazharul/nsite/main/install.sh | bash
 ```
+
+It clones the repo to `~/.local/share/nsite`, links `nsite` onto your PATH
+(the only step that may ask for sudo), and offers tab completion. Re-running
+it updates to the latest version. Uninstall: `install.sh --uninstall`.
+
+<details>
+<summary>Manual install instead</summary>
+
+```sh
+git clone https://github.com/csemazharul/nsite ~/www/nsite
+chmod +x ~/www/nsite/nsite
+sudo ln -s ~/www/nsite/nsite /usr/local/bin/nsite
+echo "source ~/www/nsite/nsite-completion.bash" >> ~/.bashrc   # optional
+```
+</details>
 
 ## Usage
 
