@@ -87,6 +87,7 @@ nsite secure <site>
 nsite unsecure <site>
 nsite domain <new-domain>            # site inferred from first label
 nsite domain <site> <new-domain>     # explicit, when name ≠ hostname
+nsite config [www [dir] | tld <tld>]
 nsite help
 ```
 
@@ -163,7 +164,14 @@ TLD="test"        # sites become <name>.test
 PHP_SOCK=""       # empty = auto-detect newest running PHP-FPM socket
 ```
 
-No config file is needed if the defaults suit you.
+No config file is needed if the defaults suit you. You can also manage it
+from the terminal:
+
+```sh
+nsite config              # show current settings
+nsite config www ~/code   # change the projects root (no arg = current dir)
+nsite config tld dev      # change the default TLD for new sites
+```
 
 ## Non-goals
 

@@ -159,6 +159,25 @@ non-zero if anything failed, so it's scriptable.
 
 ---
 
+## `nsite config [key] [value]`
+
+View or change nsite's defaults from the terminal — it edits the same
+plain-bash config file you could edit by hand (`~/.config/nsite/config`).
+
+```sh
+nsite config              # show current settings + config file location
+nsite config www ~/code   # projects root: nsite add now looks in ~/code/<name>
+nsite config www          # no argument = use the current directory
+nsite config tld dev      # new sites default to <name>.dev (TLD warnings apply)
+```
+
+Changes affect **new** sites only; existing sites keep their config and
+hostname (move one with `nsite domain`). Unlike Valet's `park`, this does
+not auto-serve every folder — sites are still created explicitly with
+`nsite add`.
+
+---
+
 ## `nsite help` / `nsite --version`
 
 Usage text with examples / the version string.

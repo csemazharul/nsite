@@ -7,7 +7,7 @@
 #
 set -euo pipefail
 
-VERSION="0.4.0"
+VERSION="0.5.0"
 
 # --- constants -------------------------------------------------------------
 
@@ -54,12 +54,24 @@ WWW="$HOME/www"     # where projects live
 TLD="test"          # site.test
 PHP_SOCK=""         # empty = auto-detect newest running PHP-FPM
 
+config_file() { printf '%s/nsite/config\n' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
+
 load_config() {
-    local config_file="${XDG_CONFIG_HOME:-$HOME/.config}/nsite/config"
-    if [[ -f "$config_file" ]]; then
+    local file
+    file="$(config_file)"
+    if [[ -f "$file" ]]; then
         # shellcheck disable=SC1090  # user config path is dynamic by design
-        source "$config_file"
+        source "$file"
     fi
+}
+
+set_config_var() { # <VAR> <value> — update or append VAR="value" in the config
+    local var="$1" value="$2" file
+    file="$(config_file)"
+    mkdir -p "$(dirname "$file")"
+    touch "$file"
+    sed -i -E "/^${var}=/d" "$file"
+    printf '%s="%s"\n' "$var" "$value" >> "$file"
 }
 
 # --- system checks ---------------------------------------------------------
@@ -785,6 +797,44 @@ cmd_domain() { # change an existing site's hostname, e.g. blog.test → blog.dev
     info "'$site' now answers to http://$newhost (was $oldhost)"
 }
 
+# --- config ----------------------------------------------------------------
+
+cmd_config() {
+    local key="${1:-}" value="${2:-}"
+    case "$key" in
+        "")
+            info "config file: $(config_file)"
+            printf '  WWW      = %s   (projects root)\n' "$WWW"
+            printf '  TLD      = %s   (new sites become <name>.%s)\n' "$TLD" "$TLD"
+            printf '  PHP_SOCK = %s\n' "${PHP_SOCK:-(auto-detect newest running PHP-FPM)}"
+            ;;
+        www)
+            value="${value:-$PWD}"
+            local abs
+            if ! abs="$(cd "$value" 2>/dev/null && pwd)"; then
+                die "'$value' is not a directory"
+            fi
+            set_config_var WWW "$abs"
+            info "projects root is now $abs"
+            printf "  'nsite add <name>' now looks for projects in %s/<name>\n" "$abs"
+            printf '  existing sites are unaffected\n'
+            ;;
+        tld)
+            if [[ -z "$value" ]]; then die "usage: nsite config tld <tld>   (e.g. nsite config tld test)"; fi
+            if [[ ! "$value" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
+                die "'$value' is not a valid TLD"
+            fi
+            tld_warnings "${value##*.}"
+            set_config_var TLD "$value"
+            info "new sites will be created as <name>.$value"
+            printf "  existing sites keep their hostname — move one with 'nsite domain <name>.%s'\n" "$value"
+            ;;
+        *)
+            die "unknown config key '$key' — known keys: www, tld (or run 'nsite config' to view)"
+            ;;
+    esac
+}
+
 # --- help ------------------------------------------------------------------
 
 usage() {
@@ -812,6 +862,11 @@ ${C_BOLD}Usage:${C_RESET}
   nsite domain <new-domain> | nsite domain <site> <new-domain>
                         Change a site's hostname (re-issues TLS if secured);
                         one-arg form infers the site from the first label
+  nsite config          Show current settings (projects root, TLD, socket)
+  nsite config www [dir]
+                        Set the projects root (no dir = current directory)
+  nsite config tld <tld>
+                        Set the default TLD for new sites
   nsite help            This text
 
 ${C_BOLD}Examples:${C_RESET}
@@ -840,7 +895,7 @@ main() {
         -v|--version)
             printf 'nsite %s\n' "$VERSION"
             ;;
-        add|rm|list|php|logs|doctor|secure|unsecure|domain)
+        add|rm|list|php|logs|doctor|secure|unsecure|domain|config)
             check_system
             load_config
             "cmd_$cmd" "$@"

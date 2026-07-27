@@ -21,7 +21,7 @@ _nsite() {
     cmd="${COMP_WORDS[1]:-}"
 
     if [[ $COMP_CWORD -eq 1 ]]; then
-        mapfile -t COMPREPLY < <(compgen -W "add rm list php logs doctor secure unsecure domain help" -- "$cur")
+        mapfile -t COMPREPLY < <(compgen -W "add rm list php logs doctor secure unsecure domain config help" -- "$cur")
         return
     fi
     case "$cmd" in
@@ -30,6 +30,13 @@ _nsite() {
             ;;
         add)
             mapfile -t COMPREPLY < <(compgen -W "--php --root --proxy --tld --force --dry-run" -- "$cur")
+            ;;
+        config)
+            if [[ $COMP_CWORD -eq 2 ]]; then
+                mapfile -t COMPREPLY < <(compgen -W "www tld" -- "$cur")
+            elif [[ "${COMP_WORDS[2]}" == www ]]; then
+                mapfile -t COMPREPLY < <(compgen -d -- "$cur")
+            fi
             ;;
         php)
             if [[ $COMP_CWORD -eq 2 ]]; then
