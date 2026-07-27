@@ -35,7 +35,11 @@ Running it from a local checkout (`./install.sh`) installs from that checkout
 instead of cloning. Environment overrides: `NSITE_INSTALL_DIR` (code location),
 `NSITE_BIN_DIR` (symlink location).
 
-To remove: `~/.local/share/nsite/install.sh --uninstall`.
+To remove:
+
+```sh
+~/.local/share/nsite/install.sh --uninstall
+```
 
 ### Manual
 

@@ -53,7 +53,11 @@ curl -fsSL https://raw.githubusercontent.com/csemazharul/nsite/main/install.sh |
 
 It clones the repo to `~/.local/share/nsite`, links `nsite` onto your PATH
 (the only step that may ask for sudo), and offers tab completion. Re-running
-it updates to the latest version. Uninstall: `install.sh --uninstall`.
+it updates to the latest version. To uninstall:
+
+```sh
+~/.local/share/nsite/install.sh --uninstall
+```
 
 <details>
 <summary>Manual install instead</summary>
