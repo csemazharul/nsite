@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+#
+# nsite — manage local nginx dev sites (vhost + symlink + /etc/hosts + reload)
+#
+# Additive by design: only ever writes files it created itself.
+# All state lives in the nginx configs — no database, no JSON.
+#
+set -euo pipefail
+
+VERSION="0.1.0"
+
+# --- constants -------------------------------------------------------------
+
+NGINX_AVAIL="/etc/nginx/sites-available"
+NGINX_ENABLED="/etc/nginx/sites-enabled"
+# shellcheck disable=SC2034  # used from phase 1 (remove directive then)
+HOSTS_FILE="/etc/hosts"
+
+# --- output helpers --------------------------------------------------------
+
+# Colours only when writing to a terminal, so piped output stays clean.
+if [[ -t 1 ]]; then
+    C_GREEN=$'\033[32m' C_YELLOW=$'\033[33m' C_BOLD=$'\033[1m' C_RESET=$'\033[0m'
+else
+    C_GREEN="" C_YELLOW="" C_BOLD="" C_RESET=""
+fi
+if [[ -t 2 ]]; then
+    C_RED=$'\033[31m' C_ERESET=$'\033[0m'
+else
+    C_RED="" C_ERESET=""
+fi
+
+info() { printf '%s==>%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+warn() { printf '%swarning:%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
+err()  { printf '%serror:%s %s\n' "$C_RED" "$C_ERESET" "$*" >&2; }
+
+die() {
+    err "$*"
+    exit 1
+}
+
+# --- configuration ---------------------------------------------------------
+
+# Defaults; override in ${XDG_CONFIG_HOME:-~/.config}/nsite/config (plain bash).
+# shellcheck disable=SC2034  # consumed from phase 1 on (remove directive then)
+{
+    WWW="$HOME/www"     # where projects live
+    TLD="test"          # site.test
+    PHP_SOCK=""         # empty = auto-detect newest running PHP-FPM
+}
+
+load_config() {
+    local config_file="${XDG_CONFIG_HOME:-$HOME/.config}/nsite/config"
+    if [[ -f "$config_file" ]]; then
+        # shellcheck disable=SC1090  # user config path is dynamic by design
+        source "$config_file"
+    fi
+}
+
+# --- system checks ---------------------------------------------------------
+
+check_system() {
+    if [[ "$EUID" -eq 0 ]]; then
+        die "do not run nsite as root — it calls sudo itself for the few commands that need it"
+    fi
+    command -v nginx >/dev/null \
+        || die "nginx is not installed (or not in PATH)"
+    [[ -d "$NGINX_AVAIL" ]] \
+        || die "$NGINX_AVAIL not found — nsite requires a Debian-style nginx layout"
+    [[ -d "$NGINX_ENABLED" ]] \
+        || die "$NGINX_ENABLED not found — nsite requires a Debian-style nginx layout"
+}
+
+# --- help ------------------------------------------------------------------
+
+usage() {
+    cat <<EOF
+${C_BOLD}nsite${C_RESET} $VERSION — manage local nginx dev sites
+
+${C_BOLD}Usage:${C_RESET}
+  nsite add <name> [--php <version>] [--root <subdir>] [--proxy <port>]
+                   [--force] [--dry-run]
+                        Create vhost + symlink + hosts entry, test, reload
+  nsite rm <name>       Remove a site's nginx config and hosts entry
+  nsite list            Show enabled sites and their PHP versions
+  nsite php list        Show installed PHP versions and FPM status
+  nsite php use <site> <version>
+                        Point one site at another PHP-FPM version
+  nsite php cli <version>
+                        Switch the terminal default (php -v) — sites unaffected
+  nsite php current [site]
+                        Show a site's PHP version, or all of them
+  nsite help            This text
+
+${C_BOLD}Examples:${C_RESET}
+  nsite add blog                  # serves ~/www/blog at http://blog.test
+  nsite add shop --php 8.3        # same, pinned to PHP-FPM 8.3
+  nsite php use blog 8.4          # move blog.test to PHP 8.4 (browser only)
+  nsite rm blog                   # remove config + hosts entry, keep ~/www/blog
+
+Config: ${XDG_CONFIG_HOME:-$HOME/.config}/nsite/config (bash, optional)
+Defaults: WWW=\$HOME/www  TLD=test  PHP_SOCK= (auto-detect)
+EOF
+}
+
+# --- commands (stubs — filled in by later phases) --------------------------
+
+cmd_add()  { die "'add' is not implemented yet (phase 1)"; }
+cmd_rm()   { die "'rm' is not implemented yet (phase 1)"; }
+cmd_list() { die "'list' is not implemented yet (phase 1)"; }
+cmd_php()  { die "'php' is not implemented yet (phase 2)"; }
+
+# --- dispatch --------------------------------------------------------------
+
+main() {
+    local cmd="${1:-help}"
+    [[ $# -gt 0 ]] && shift
+
+    case "$cmd" in
+        help|-h|--help)
+            usage
+            ;;
+        -v|--version)
+            printf 'nsite %s\n' "$VERSION"
+            ;;
+        add|rm|list|php)
+            check_system
+            load_config
+            "cmd_$cmd" "$@"
+            ;;
+        *)
+            die "unknown command '$cmd' — try 'nsite help'"
+            ;;
+    esac
+}
+
+main "$@"
