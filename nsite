@@ -7,7 +7,7 @@
 #
 set -euo pipefail
 
-VERSION="0.3.0"
+VERSION="0.4.0"
 
 # --- constants -------------------------------------------------------------
 
@@ -638,6 +638,52 @@ cmd_secure() {
     info "https://$host is ready (plain http:// still works too)"
 }
 
+# --- unsecure --------------------------------------------------------------
+
+cmd_unsecure() { # remove the TLS directives + certificate that 'secure' added
+    local site="${1:-}"
+    if [[ -z "$site" ]]; then die "usage: nsite unsecure <site>"; fi
+    local conf="$NGINX_AVAIL/$site"
+    if [[ ! -e "$conf" ]]; then die "no site named '$site'"; fi
+    if ! is_managed "$conf"; then
+        die "'$site' is a hand-written config — remove its ssl directives yourself to be safe"
+    fi
+    if ! grep -q "ssl_certificate" "$conf"; then
+        info "'$site' has no TLS configured — nothing to do"
+        return 0
+    fi
+    local host
+    host="$(conf_value "$conf" server_name)"
+
+    local backup
+    backup="$(mktemp)"
+    cp "$conf" "$backup"
+    sudo sed -i -E \
+        -e '/^[[:space:]]*listen (\[::\]:)?443 ssl;$/d' \
+        -e "\|^[[:space:]]*ssl_certificate(_key)? $CERT_DIR/.*;\$|d" \
+        "$conf"
+    if grep -q "ssl_certificate" "$conf"; then
+        sudo cp "$backup" "$conf"
+        rm -f "$backup"
+        die "could not cleanly remove the TLS directives (edited by hand?) — config restored, edit $conf yourself"
+    fi
+    if ! sudo nginx -t; then
+        sudo cp "$backup" "$conf"
+        rm -f "$backup"
+        die "nginx -t failed — restored the previous config"
+    fi
+    rm -f "$backup"
+    sudo systemctl reload nginx
+    if [[ -n "$host" ]]; then
+        sudo rm -f "$CERT_DIR/$host.pem" "$CERT_DIR/$host-key.pem"
+    fi
+    info "'$site' is back to plain http://$host"
+    case "${host##*.}" in
+        dev|app)
+            warn ".${host##*.} is HSTS-preloaded — browsers still force https, so the site will NOT load; consider 'nsite domain $site.test'" ;;
+    esac
+}
+
 # --- domain ----------------------------------------------------------------
 
 cmd_domain() { # change an existing site's hostname, e.g. blog.test → blog.dev
@@ -742,6 +788,7 @@ ${C_BOLD}Usage:${C_RESET}
                         Tail a site's nginx access + error logs
   nsite doctor          Check services, sockets, symlinks and hosts entries
   nsite secure <site>   Add https:// via a locally-trusted mkcert certificate
+  nsite unsecure <site> Remove the https:// config + certificate again
   nsite domain <new-domain> | nsite domain <site> <new-domain>
                         Change a site's hostname (re-issues TLS if secured);
                         one-arg form infers the site from the first label
@@ -773,7 +820,7 @@ main() {
         -v|--version)
             printf 'nsite %s\n' "$VERSION"
             ;;
-        add|rm|list|php|logs|doctor|secure|domain)
+        add|rm|list|php|logs|doctor|secure|unsecure|domain)
             check_system
             load_config
             "cmd_$cmd" "$@"

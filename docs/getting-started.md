@@ -85,6 +85,12 @@ Uses mkcert, stores certs in `/etc/nginx/nsite-certs/`, and appends the
 `listen 443 ssl` lines to the site's config. Plain http keeps working.
 Refuses hand-written configs (it won't guess at their structure).
 
+To undo it:
+
+```sh
+nsite unsecure blog            # back to plain http://, certificate removed
+```
+
 ## Changing a site's domain
 
 ```sh

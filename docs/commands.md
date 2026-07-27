@@ -127,6 +127,21 @@ Required for `.dev`/`.app` TLDs, which browsers force to HTTPS.
 
 ---
 
+## `nsite unsecure <site>`
+
+The exact inverse of `secure`: removes the `listen 443 ssl` and
+`ssl_certificate` lines nsite added, deletes the site's certificate from
+`/etc/nginx/nsite-certs/`, tests and reloads.
+
+- No-op with a friendly message if the site isn't secured.
+- Refuses hand-written configs.
+- If the TLS lines were hand-edited and can't be removed cleanly, the
+  config is restored untouched and you're told to edit it yourself.
+- Warns on `.dev`/`.app` sites: browsers force HTTPS on those TLDs, so an
+  unsecured site there won't load — switch its domain back to `.test` instead.
+
+---
+
 ## `nsite logs <site> [-f]`
 
 Show the last lines of the site's per-site nginx logs

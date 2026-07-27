@@ -66,6 +66,7 @@ nsite php current [site]
 nsite logs <site> [-f]
 nsite doctor
 nsite secure <site>
+nsite unsecure <site>
 nsite domain <new-domain>            # site inferred from first label
 nsite domain <site> <new-domain>     # explicit, when name ≠ hostname
 nsite help

@@ -21,11 +21,11 @@ _nsite() {
     cmd="${COMP_WORDS[1]:-}"
 
     if [[ $COMP_CWORD -eq 1 ]]; then
-        mapfile -t COMPREPLY < <(compgen -W "add rm list php logs doctor secure domain help" -- "$cur")
+        mapfile -t COMPREPLY < <(compgen -W "add rm list php logs doctor secure unsecure domain help" -- "$cur")
         return
     fi
     case "$cmd" in
-        rm|logs|secure|domain)
+        rm|logs|secure|unsecure|domain)
             mapfile -t COMPREPLY < <(compgen -W "$(_nsite_sites)" -- "$cur")
             ;;
         add)
