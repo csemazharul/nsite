@@ -32,6 +32,7 @@ else
 fi
 
 info() { printf '%s==>%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+step() { printf '  %s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
 warn() { printf '%swarning:%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
 err()  { printf '%serror:%s %s\n' "$C_RED" "$C_ERESET" "$*" >&2; }
 
@@ -162,6 +163,15 @@ tld_warnings() { # <tld> — flag TLD choices with real-world side effects
         *)
             warn ".$1 is a real public TLD — this hosts entry will shadow any real *.$1 site of the same name" ;;
     esac
+}
+
+nginx_test() { # quiet 'sudo nginx -t': silent when ok, full output when not
+    local out
+    if out="$(sudo nginx -t 2>&1)"; then
+        return 0
+    fi
+    printf '%s\n' "$out" >&2
+    return 1
 }
 
 hosts_has() { # <hostname> — is it already resolvable via /etc/hosts?
@@ -347,18 +357,22 @@ cmd_add() {
     fi
     if [[ -L "$link" ]]; then had_link=1; fi
 
-    info "writing $conf"
+    info "creating http://$host"
     printf '%s\n' "$content" | sudo tee "$conf" >/dev/null
+    step "config written: $conf"
     sudo ln -sfn "$conf" "$link"
+    step "site enabled"
 
     local hosts_added=0
     if ! hosts_has "$host"; then
-        info "adding $host to $HOSTS_FILE"
         printf '127.0.0.1\t%s\n' "$host" | sudo tee -a "$HOSTS_FILE" >/dev/null
         hosts_added=1
+        step "hosts entry added: 127.0.0.1 $host"
+    else
+        step "hosts entry already present"
     fi
 
-    if ! sudo nginx -t; then
+    if ! nginx_test; then
         err "nginx -t rejected the new config — rolling back"
         if [[ $had_conf -eq 1 ]]; then
             sudo cp "$backup" "$conf"
@@ -372,11 +386,12 @@ cmd_add() {
     fi
     if [[ -n "$backup" ]]; then rm -f "$backup"; fi
     sudo systemctl reload nginx
+    step "nginx tested and reloaded"
 
     if [[ -n "$proxy_port" ]]; then
-        info "site ready: http://$host → http://127.0.0.1:$proxy_port"
+        info "ready: http://$host → http://127.0.0.1:$proxy_port"
     else
-        info "site ready: http://$host → $docroot (${sock##*/})"
+        info "ready: http://$host → $docroot (${sock##*/})"
     fi
 }
 
@@ -398,11 +413,17 @@ cmd_rm() {
     if ! confirm "remove site '$name'? (nginx config + hosts entry; $WWW/$name is untouched)"; then
         die "aborted — nothing changed"
     fi
+    info "removing '$name'"
     sudo rm -f "$link" "$conf"
-    if [[ -n "$host" && "$host" != "_" ]]; then remove_hosts_line "$host"; fi
-    sudo nginx -t
+    step "nginx config and symlink removed"
+    if [[ -n "$host" && "$host" != "_" ]]; then
+        remove_hosts_line "$host"
+        step "hosts entry for $host removed"
+    fi
+    nginx_test
     sudo systemctl reload nginx
-    info "removed '$name' — project files in $WWW/$name are untouched"
+    step "nginx reloaded"
+    info "done — project files in $WWW/$name are untouched"
 }
 
 # --- list ------------------------------------------------------------------
@@ -458,7 +479,7 @@ php_use() {
     backup="$(mktemp)"
     cp "$conf" "$backup"
     sudo sed -i -E "s|^([[:space:]]*fastcgi_pass[[:space:]]+)unix:[^;]+;|\1unix:/run/php/php$v-fpm.sock;|" "$conf"
-    if ! sudo nginx -t; then
+    if ! nginx_test; then
         sudo cp "$backup" "$conf"
         rm -f "$backup"
         die "nginx -t failed — restored the previous config"
@@ -539,19 +560,18 @@ cmd_logs() {
 
 cmd_doctor() {
     local fails=0
-    ok()  { printf '  %s✓%s %s\n' "$C_GREEN" "$C_RESET" "$1"; }
     bad() { printf '  %s✗%s %s\n' "$C_RED" "$C_ERESET" "$1"; fails=$((fails + 1)); }
 
     info "services"
     if systemctl is-active --quiet nginx; then
-        ok "nginx running"
+        step "nginx running"
     else
         bad "nginx not running (sudo systemctl start nginx)"
     fi
     local v
     while read -r v; do
         if systemctl is-active --quiet "php$v-fpm"; then
-            ok "php$v-fpm running"
+            step "php$v-fpm running"
         else
             bad "php$v-fpm installed but not running (sudo systemctl start php$v-fpm)"
         fi
@@ -584,7 +604,7 @@ cmd_doctor() {
                 bad "$name: PHP socket $sock does not exist (FPM not running?)"
             fi
         fi
-        if [[ $fails -eq $before ]]; then ok "$name"; fi
+        if [[ $fails -eq $before ]]; then step "$name"; fi
     done
 
     if [[ $fails -eq 0 ]]; then
@@ -628,7 +648,7 @@ cmd_secure() {
     backup="$(mktemp)"
     cp "$conf" "$backup"
     sudo sed -i "/^[[:space:]]*listen \[::\]:80;\$/a\\    listen 443 ssl;\\n    listen [::]:443 ssl;\\n    ssl_certificate $CERT_DIR/$host.pem;\\n    ssl_certificate_key $CERT_DIR/$host-key.pem;" "$conf"
-    if ! sudo nginx -t; then
+    if ! nginx_test; then
         sudo cp "$backup" "$conf"
         rm -f "$backup"
         die "nginx -t failed — restored the previous config"
@@ -667,7 +687,7 @@ cmd_unsecure() { # remove the TLS directives + certificate that 'secure' added
         rm -f "$backup"
         die "could not cleanly remove the TLS directives (edited by hand?) — config restored, edit $conf yourself"
     fi
-    if ! sudo nginx -t; then
+    if ! nginx_test; then
         sudo cp "$backup" "$conf"
         rm -f "$backup"
         die "nginx -t failed — restored the previous config"
@@ -750,7 +770,7 @@ cmd_domain() { # change an existing site's hostname, e.g. blog.test → blog.dev
         added_new=1
     fi
 
-    if ! sudo nginx -t; then
+    if ! nginx_test; then
         err "nginx -t failed — rolling back"
         sudo cp "$backup" "$conf"
         if [[ $added_new -eq 1 ]]; then remove_hosts_line "$newhost"; fi
